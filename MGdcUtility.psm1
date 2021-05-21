@@ -6,15 +6,15 @@
         [parameter(Mandatory=$true)]
         [System.String]
         $AppId,
-        
+
         [parameter(Mandatory=$true)]
         [System.String]
         $TenantId,
-        
+
         [parameter(Mandatory=$true)]
         [System.String]
         $Secret,
-        
+
         [parameter(Mandatory = $true)]
         [System.String]
         [ValidateSet('Messages')]
@@ -43,63 +43,72 @@
     Write-Verbose -Message "Connecting to Microsoft Graph"
     Connect-MgGraph -AccessToken $AccessToken | Out-Null
 
-    $allUsers = Get-MgUser -All:$true
+    Write-Verbose "Obtaining report file for {$Entity}"
+    $tempReportPath = Join-Path -Path $env:TEMP -ChildPath "graphreport.csv"
+    Remove-Item $tempReportPath -Force -ErrorAction SilentlyContinue
+    New-Item -Path $tempReportPath -Force | Out-Null
 
-    $foldersToFilterOut = @()#@("Conversation History", "Sent Items", "Deleted Items")
-
-    $total = 0
-    $jobName = "MGdcEstimateJob" + (New-Guid).ToString()
-
-    $totalNumberOfUsers = $allUsers.Length
-    $numberOfParallelThreads = 4
-    $instances = Split-ArrayByParts -Array $allUsers `
-        -Parts $numberOfParallelThreads
-
-    foreach ($batch in $instances)
+    #region Determine Period's Length
+    $period = "D180"
+    if ($NumberOfDays -le 7)
     {
-        Start-Job -Name "$($jobName + $index)" -ScriptBlock {
-            param(
-                [System.Object[]]
-                $Batch,
-
-                [System.String]
-                $AccessToken
-            )            
-            Connect-MgGraph -AccessToken $AccessToken | Out-Null
-            $mailFolders = @()
-            foreach ($user in $Batch)
-            {
-                $mailFolders += Get-MgUserMailFolder -UserId $User.Id -ErrorAction SilentlyContinue
-            }
-            return $mailFolders
-        } -ArgumentList @($batch, $AccessToken) | Out-Null
+        $period = "D7"
     }
-
-    do
+    elseif ($NumberOfDays -gt 7 -and $NumberOfDays -le 30)
     {
-        [array]$pendingJobs = Get-Job | Where-Object -FilterScript { $_.Name -like 'MGdcEstimateJob*' -and $_.JobStateInfo.State -notin @('Complete', 'Blocked', 'Failed')}
-        [array]$CompletedJobs = Get-Job | Where-Object -FilterScript { $_.Name -like 'MGdcEstimateJob*' -and $_.JobStateInfo.State -eq 'Complete'}
+        $period = "D30"
+    }
+    elseif ($NumberOfDays -gt 30 -and $NumberOfDays -le 90)
+    {
+        $period = "D90"
+    }
+    #endregion
 
-        foreach ($completedJob in $CompletedJobs)
+    #region Determine users in specified groups
+    [array]$users = @()
+    foreach ($groupID in $GroupsID)
+    {
+        $groupMembers = Get-MgGroupMember -GroupId $groupId
+
+        foreach ($member in $groupMembers)
         {
-            $currentContent = Receive-Job -Name $completedJob.name
-            $mailFolders = $currentContent
-            Remove-Job -Name $completedJob.name -ErrorAction SilentlyContinue
-            if ($null -ne $mailFolders)
+            $user = Get-MgUser -UserId $member.Id
+            $users += $user.UserPrincipalName
+        }
+    }
+    #endregion
+
+    switch($entity)
+    {
+        "Messages"
+        {
+            Write-Verbose -Message "Retrieving emails based on {$period}"
+            $url = "https://graph.microsoft.com/v1.0/reports/getMailboxUsageDetail(period='$period')"
+            Invoke-MgGraphRequest -Uri $url `
+                -OutputFilePath $tempReportPath | Out-Null
+            $parsedReport = Import-Csv $tempReportPath
+
+            $InboxEmailCount   = 0
+            $DeletedEmailCount = 0
+
+            # Count Emails for all users
+            foreach ($user in $parsedReport)
             {
-                foreach ($folder in $mailFolders)
+                if (($users.Length -gt 0 -and $users.Contains($user.'User Principal Name')) -or $users.Length -eq 0)
                 {
-                    if (-not $foldersToFilterOut.Contains($folder.DisplayName))
-                    {
-                        $total += $folder.TotalItemCount
-                    }
+                    $InboxEmailCount += $user.'Item Count'
+                    $DeletedEmailCount += $user.'Deleted Item Count'
                 }
             }
-        }
 
-    } while ($pendingJobs.Length -gt 0)
-    
-    return $total
+            $results = @{
+                EmailsInInbox = $InboxEmailCount
+                DeletedEmails = $DeletedEmailCount
+                TotalItems = $InboxEmailCount + $DeletedEmailCount
+            }
+        }
+    }
+    return $results
 }
 
 function Split-ArrayByParts
