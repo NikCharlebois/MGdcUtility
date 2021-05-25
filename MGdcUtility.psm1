@@ -69,7 +69,7 @@
     foreach ($groupID in $GroupsID)
     {
         # Check if group is received by email address instead of by ID
-        if ($groupId -contains '@')
+        if ($groupId -like "*@*")
         {
             $groupId = (Get-MGGroup -Filter "Mail eq '$groupId'").Id
         }
